@@ -23,7 +23,7 @@ app.set("sequelize", sequelize);
 app.set("models", sequelize.models);
 
 /**
- * It took me 2 hours more to complete the unit tests because i had to refactor the code :p 
+ * It took me 2 hours more (done in different day) to complete the unit tests because i had to refactor the code :p 
  * also, i think some endpoints that only do queries should be better tested with using 
  * the actual DB and the test data
  * (cleaning the DB and then starting the server in order to make actual requests),
