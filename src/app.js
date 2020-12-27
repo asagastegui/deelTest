@@ -1,6 +1,7 @@
 const express = require("express");
 const bodyParser = require("body-parser");
 const { sequelize } = require("./model");
+const { Op } = require("sequelize");
 const { getProfile } = require("./middleware/getProfile");
 const {
   getWhereClause,
@@ -13,7 +14,11 @@ const {
   makePayJobTransaction,
   getJobsPendingSum,
 } = require("./controllers/Jobs");
-const { validateDateFormat } = require('./controllers/utils');
+const {
+  validateDateFormat,
+  getEarnedMost,
+  getBestClient,
+} = require("./controllers/utils");
 const { canMakeDeposit, makeDepositToUser } = require("./controllers/Profile");
 
 const app = express();
@@ -23,8 +28,8 @@ app.set("sequelize", sequelize);
 app.set("models", sequelize.models);
 
 /**
- * It took me 2 hours more (done in different day) to complete the unit tests because i had to refactor the code :p 
- * also, i think some endpoints that only do queries should be better tested with using 
+ * It took me 2 hours more (done in different day) to complete the unit tests because i had to refactor the code :p
+ * also, i think some endpoints that only do queries should be better tested with using
  * the actual DB and the test data
  * (cleaning the DB and then starting the server in order to make actual requests),
  * because those endpoints only make requests (all the "logic" are embebed into the query)
@@ -138,31 +143,36 @@ app.post("/balances/deposit/:user_id", getProfile, async (req, res) => {
 app.get("/admin/best-profession", getProfile, async (req, res) => {
   try {
     const { start, end } = req.query;
-    if(
-        !validateDateFormat(start, "YYYY-MM-DD") || 
-        !validateDateFormat(end, "YYYY-MM-DD")
-    ){
-        return res.status(404).end();
+    const { Job, Profile, Contract } = req.app.get("models");
+    if (
+      !validateDateFormat(start, "YYYY-MM-DD") ||
+      !validateDateFormat(end, "YYYY-MM-DD")
+    ) {
+      return res.status(404).end();
     }
-    const earnedMost = await req.app.get("sequelize").query(
-      `select max(ganancia), profession from (select sum(price) ganancia, profession
-        from (select * from jobs
-            where paymentDate >= :startDate and paymentDate <= :endDate
-            ) Jobs
-            join Contracts C on Jobs.ContractId = C.id
-            join Profiles P on C.ContractorId = P.id
-        where 1=1
-            and paid IS NOT NUll
-        group by p.profession)`,
-      {
-        replacements: {
-          startDate: start,
-          endDate: end,
+    const profilesWithJobs = await Profile.findAll({
+      where: { type: "contractor" },
+      include: [
+        {
+          model: Contract,
+          as: "Contractor",
+          include: [
+            {
+              model: Job,
+              where: {
+                paid: 1,
+                paymentDate: {
+                  [Op.gte]: start,
+                  [Op.lte]: end,
+                },
+              },
+            },
+          ],
         },
-        type: QueryTypes.SELECT,
-      }
-    );
-    res.json({ profession: earnedMost[0].profession });
+      ],
+    });
+    const result = getEarnedMost(profilesWithJobs);
+    res.json({ profession: result.earnedMost.prof });
   } catch (err) {
     console.log(err);
     return res.status(404).end();
@@ -172,33 +182,32 @@ app.get("/admin/best-profession", getProfile, async (req, res) => {
 app.get("/admin/best-clients", getProfile, async (req, res) => {
   try {
     const { start, end, limit = 2 } = req.query;
-    if(
-        !validateDateFormat(start, "YYYY-MM-DD") || 
-        !validateDateFormat(end, "YYYY-MM-DD")
-    ){
-        return res.status(404).end();
+    const { Job, Profile, Contract } = req.app.get("models");
+    if (
+      !validateDateFormat(start, "YYYY-MM-DD") ||
+      !validateDateFormat(end, "YYYY-MM-DD")
+    ) {
+      return res.status(404).end();
     }
-    const bestClients = await req.app.get("sequelize").query(
-      `select Jobs.id id,price paid, p.firstName || ' ' || p.lastName fullName
-        from (select * from jobs
-            where paymentDate >= :startDate and paymentDate <= :endDate
-            ) Jobs
-            join Contracts C on Jobs.ContractId = C.id
-            join Profiles P on C.ClientId = P.id
-        where 1=1
-            and paid IS NOT NUll
-        order by price desc
-        limit :limit`,
-      {
-        replacements: {
-          startDate: start,
-          endDate: end,
-          limit,
-        },
-        type: QueryTypes.SELECT,
-      }
-    );
-    res.json(bestClients);
+    const clientsWithJobs = await Profile.findAll({
+      where: { type: "client" },
+      include: [{
+          model: Contract,
+          as: "Client",
+          include: [{
+              model: Job,
+              where: {
+                paid: 1,
+                paymentDate: {
+                  [Op.gte]: start,
+                  [Op.lte]: end,
+                },
+              },
+          }],
+      }],
+    });
+    const bestClient = getBestClient(clientsWithJobs, limit);
+    res.json(bestClient);
   } catch (err) {
     console.log(err);
     return res.status(404).end();
