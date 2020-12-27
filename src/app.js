@@ -1,130 +1,207 @@
-const express = require('express');
-const bodyParser = require('body-parser');
-const {sequelize} = require('./model');
-const {getProfile} = require('./middleware/getProfile');
-const { getWhereClause, getWhereAllNoTerm, getWhereAllActive } = require('./controllers/Contracts');
+const express = require("express");
+const bodyParser = require("body-parser");
+const { sequelize } = require("./model");
+const { getProfile } = require("./middleware/getProfile");
+const {
+  getWhereClause,
+  getWhereAllNoTerm,
+  getWhereAllActive,
+} = require("./controllers/Contracts");
+const {
+  getWhereUnpaid,
+  getInstancesRelated,
+  makePayJobTransaction,
+  getJobsPendingSum,
+} = require("./controllers/Jobs");
+const { validateDateFormat } = require('./controllers/utils');
+const { canMakeDeposit, makeDepositToUser } = require("./controllers/Profile");
+
 const app = express();
 const { QueryTypes } = require("sequelize");
 app.use(bodyParser.json());
-app.set('sequelize', sequelize);
-app.set('models', sequelize.models);
+app.set("sequelize", sequelize);
+app.set("models", sequelize.models);
 
 /**
- * FIX ME!
+ * It took me 2 hours more to complete the unit tests because i had to refactor the code :p 
+ * also, i think some endpoints that only do queries should be better tested with using 
+ * the actual DB and the test data
+ * (cleaning the DB and then starting the server in order to make actual requests),
+ * because those endpoints only make requests (all the "logic" are embebed into the query)
+ * (becase is faster filter using the query than after the query do some filter)
+ */
+
+/**
  * @returns contract by id
  */
-app.get('/contracts/:id',getProfile ,async (req, res) =>{
-    const {Contract} = req.app.get('models')
-    const {id} = req.params
-    const whereClause = getWhereClause(id, req.profile.type , req.profile.id);
-    if(!whereClause) return res.status(404).end();
-    const contract = await Contract.findOne({where:whereClause});
-    if(!contract) return res.status(404).end()
-    res.json(contract)
-})
-
-app.get('/contracts', getProfile, async (req, res) => {
-    const {Contract} = req.app.get('models')
-    const whereClause = getWhereAllNoTerm(req.profile.type , req.profile.id);
-    if(!whereClause) return res.status(404).end();
-    const contract = await Contract.findAll({where:whereClause});
-    if(!contract) return res.status(404).end()
-    res.json(contract)
+app.get("/contracts/:id", getProfile, async (req, res) => {
+  try {
+    const { Contract } = req.app.get("models");
+    const { id } = req.params;
+    const whereClause = getWhereClause(id, req.profile.type, req.profile.id);
+    if (!whereClause) return res.status(404).end();
+    const contract = await Contract.findOne({ where: whereClause });
+    if (!contract) return res.status(404).end();
+    res.json(contract);
+  } catch (err) {
+    console.log(err);
+    return res.status(404).end();
+  }
+});
+/**
+ * @returns All contracts that are not terminated and belongs to the logged profile
+ */
+app.get("/contracts", getProfile, async (req, res) => {
+  try {
+    const { Contract } = req.app.get("models");
+    const whereClause = getWhereAllNoTerm(req.profile.type, req.profile.id);
+    if (!whereClause) return res.status(404).end();
+    const contract = await Contract.findAll({ where: whereClause });
+    if (!contract) return res.status(404).end();
+    res.json(contract);
+  } catch (err) {
+    console.log(err);
+    return res.status(404).end();
+  }
+});
+/**
+ * @returns All the unpaid jobs that belong to the logged profile
+ */
+app.get("/jobs/unpaid", getProfile, async (req, res) => {
+  try {
+    const { Contract, Job } = req.app.get("models");
+    const contractWhere = getWhereAllActive(req.profile.type, req.profile.id);
+    const jobWhere = getWhereUnpaid();
+    if (!contractWhere || !jobWhere) return res.status(404).end();
+    const jobs = await Job.findAll({
+      where: jobWhere,
+      include: [{ model: Contract, where: contractWhere }],
+    });
+    if (!jobs) return res.status(404).end();
+    res.json(jobs);
+  } catch (err) {
+    console.log(err);
+    return res.status(404).end();
+  }
 });
 
-app.get('/jobs/unpaid', getProfile, async (req, res) => {
-    const {Contract, Job} = req.app.get('models')
-    const contractWhere = getWhereAllActive(req.profile.type , req.profile.id);
-    if(!contractWhere) return res.status(404).end();
-    const jobs = await Job.findAll({where:{paid: null}, include: [{model: Contract, where: contractWhere}]});
-    if(!jobs) return res.status(404).end()
-    res.json(jobs)
-});
-
-app.post('/jobs/:job_id/pay', getProfile, async (req, res) => {
-    // idk if  i should change the contract status when all jobs are paid.. 
-    // instructions didnt say anything
-    const {Job, Profile, Contract} = req.app.get('models');
-    const {job_id} = req.params
-    const job = await Job.findOne({where:{id: job_id, paid:null}});
-    const contract = await Contract.findOne({include: [{model:Job, where: {id: job_id}}]});
-    // if the job doesnt belong to the client, then shouldnt pay for it.
-    if(contract.ClientId !== req.profile.id) return res.status(404).end();
-    const contractor = await Profile.findOne({where: {id: contract.ContractorId}});
-    if(!job || !contract || !contractor) return res.status(404).end();
-    // Check if have enought money to pay..
-    if(req.profile.balance >= job.price ) {
-        job.paid = 1;
-        job.paymentDate = new Date();
-        await job.save();
-        req.profile.balance = req.profile.balance - job.price;
-        await req.profile.save();
-        contractor.balance += job.price;
-        await contractor.save();
+app.post("/jobs/:job_id/pay", getProfile, async (req, res) => {
+  try {
+    const { Job, Profile, Contract } = req.app.get("models");
+    const { job_id } = req.params;
+    const instances = await getInstancesRelated(job_id, req.profile.id, {
+      Job,
+      Contract,
+      Profile,
+    });
+    let payed = false;
+    if (instances) {
+      payed = await makePayJobTransaction({
+        client: req.profile,
+        ...instances,
+      });
+    } else {
+      return res.status(404).end();
     }
-    res.json({"paid_out": true});
+    res.json({ paid_out: payed });
+  } catch (err) {
+    console.log(err);
+    return res.status(404).end();
+  }
 });
 
 // ASuming the amount to deposit its on the body in the attribute "amount"
-app.post('/balances/deposit/:user_id', getProfile, async (req, res) => {
-    const {user_id} = req.params;
-    const {amount} = req.body;    
-    const {Job, Profile, Contract} = req.app.get('models');
-    const jobsPendingSum = await Job.sum('price', {where:{paid:null}, include: [{model:Contract, where: {ClientId: req.profile.id}}]});
-    // if amount to deposit is greater than 25 % of pending jobs to pay
-    // cant deposit
-    if(amount > (jobsPendingSum * .25)) {
+app.post("/balances/deposit/:user_id", getProfile, async (req, res) => {
+  try {
+    // based on what i know im assuming a deposit is different than a trasnfer (deposit)
+    // is when you go to the bank with physical money, transfer is when you move funds from
+    // your account directly to another account
+    const { user_id } = req.params;
+    const { amount } = req.body;
+    const { Job, Profile, Contract } = req.app.get("models");
+    const jobsPendingSum = await getJobsPendingSum(
+      { Job, Contract },
+      req.profile.id
+    );
+    let depositMaked = false;
+    if (canMakeDeposit(jobsPendingSum, amount)) {
+      depositMaked = await makeDepositToUser(amount, user_id, { Profile });
+    }
+    res.json({ deposit_success: depositMaked });
+  } catch (err) {
+    console.log(err);
+    return res.status(404).end();
+  }
+});
+
+// Asuming the date will be formated YYYY-MM-DD
+app.get("/admin/best-profession", getProfile, async (req, res) => {
+  try {
+    const { start, end } = req.query;
+    if(
+        !validateDateFormat(start, "YYYY-MM-DD") || 
+        !validateDateFormat(end, "YYYY-MM-DD")
+    ){
         return res.status(404).end();
-    } 
-    const userToDeposit = await Profile.findOne({where: {id: user_id}});
-    if(!userToDeposit) return res.status(404).end();
-    userToDeposit.balance += amount;
-    await userToDeposit.save();
-    res.json({"deposit_success": true});
+    }
+    const earnedMost = await req.app.get("sequelize").query(
+      `select max(ganancia), profession from (select sum(price) ganancia, profession
+        from (select * from jobs
+            where paymentDate >= :startDate and paymentDate <= :endDate
+            ) Jobs
+            join Contracts C on Jobs.ContractId = C.id
+            join Profiles P on C.ContractorId = P.id
+        where 1=1
+            and paid IS NOT NUll
+        group by p.profession)`,
+      {
+        replacements: {
+          startDate: start,
+          endDate: end,
+        },
+        type: QueryTypes.SELECT,
+      }
+    );
+    res.json({ profession: earnedMost[0].profession });
+  } catch (err) {
+    console.log(err);
+    return res.status(404).end();
+  }
 });
 
-// Asuming the date will be formated YYYY/MM/DD
-app.get('/admin/best-profession', getProfile, async (req, res) => {
-    const {start, end} = req.query;
-    const earnedMost = await req.app.get('sequelize').query(`select max(ganancia), profession from (select sum(price) ganancia, profession
-    from (select * from jobs
-        where paymentDate >= :startDate and paymentDate <= :endDate
-        ) Jobs
-        join Contracts C on Jobs.ContractId = C.id
-        join Profiles P on C.ContractorId = P.id
-    where 1=1
-        and paid IS NOT NUll
-    group by p.profession)`, {
+app.get("/admin/best-clients", getProfile, async (req, res) => {
+  try {
+    const { start, end, limit = 2 } = req.query;
+    if(
+        !validateDateFormat(start, "YYYY-MM-DD") || 
+        !validateDateFormat(end, "YYYY-MM-DD")
+    ){
+        return res.status(404).end();
+    }
+    const bestClients = await req.app.get("sequelize").query(
+      `select Jobs.id id,price paid, p.firstName || ' ' || p.lastName fullName
+        from (select * from jobs
+            where paymentDate >= :startDate and paymentDate <= :endDate
+            ) Jobs
+            join Contracts C on Jobs.ContractId = C.id
+            join Profiles P on C.ClientId = P.id
+        where 1=1
+            and paid IS NOT NUll
+        order by price desc
+        limit :limit`,
+      {
         replacements: {
-            startDate: start,
-            endDate: end,
+          startDate: start,
+          endDate: end,
+          limit,
         },
-        type: QueryTypes.SELECT
-    });
-    res.json({"profession": earnedMost[0].profession});
-});
-
-app.get('/admin/best-clients', getProfile, async (req, res) => {
-    const {start, end, limit=2} = req.query;
-    const bestClients = await req.app.get('sequelize').query(`select Jobs.id id,price paid, p.firstName || ' ' || p.lastName fullName
-    from (select * from jobs
-        where paymentDate >= :startDate and paymentDate <= :endDate
-        ) Jobs
-        join Contracts C on Jobs.ContractId = C.id
-        join Profiles P on C.ClientId = P.id
-    where 1=1
-        and paid IS NOT NUll
-    order by price desc
-    limit :limit`, {
-        replacements: {
-            startDate: start,
-            endDate: end,
-            limit
-        },
-        type: QueryTypes.SELECT
-    });
+        type: QueryTypes.SELECT,
+      }
+    );
     res.json(bestClients);
+  } catch (err) {
+    console.log(err);
+    return res.status(404).end();
+  }
 });
-
-
 module.exports = app;
